@@ -731,6 +731,25 @@ def main():
         print("FAIL — one or more quality checks failed.")
     print("=" * 65)
 
+
+    while True:
+        print()
+        user_input = input("Enter a string to evaluate or q to quit: ")
+        if user_input.lower() == "q":
+            break
+
+        sample = [user_input] # needed to make a list of batch size = 1 for predict, predict_proba
+        predictions = predict(model, sample, vocab, device, max_len=args.max_len)
+        probabilities = predict_proba(model, sample, vocab, device, max_len=args.max_len)
+        prediction = predictions[0]
+        probability = probabilities[0]
+        print(f"\n{'Utterance':<42} {'Pred':>6}  {'Conf':>6}")
+        print("-" * 58)
+        label = inv_label[int(prediction)]
+        conf = probability[int(prediction)]
+        print(f"{user_input[:40]:<42} {label:>6}  {conf:>6.2%}")
+        
+
     return 0 if all_passed else 1
 
 
