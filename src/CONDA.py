@@ -598,6 +598,44 @@ def _save_classification_report(all_targets, all_preds, output_dir, prefix):
     print("\nClassification report:")
     print(report)
 
+# ---------------------------------------------------------------------------
+# Loading full model for inference or further training
+# ---------------------------------------------------------------------------
+def load_model(
+    device: torch.device,
+    output_dir: str = "output",
+    prefix: str = "toxscan",
+):
+    """Load saved model and vocab if they exist. Returns (model, vocab) or (None, None)."""
+    ckpt_path  = os.path.join(output_dir, f"{prefix}_model.pt")
+    vocab_path = os.path.join(output_dir, f"{prefix}_vocab.json")
+
+    if not os.path.exists(ckpt_path) or not os.path.exists(vocab_path):
+        return None, None
+
+    print(f"Found existing checkpoint — loading from '{output_dir}/'")
+
+    # Rebuild vocab from saved JSON
+    with open(vocab_path, "r") as f:
+        data = json.load(f)
+    vocab = Vocabulary()
+    vocab.word2idx = data["word2idx"]
+    vocab.idx2word = {v: k for k, v in vocab.word2idx.items()}
+
+    # Rebuild model and load weights
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model = TransformerEncoderClassifier(
+        vocab_size  = ckpt["vocab_size"],
+        d_model     = ckpt["d_model"],
+        num_classes = ckpt["num_classes"],
+        max_len     = ckpt["max_len"],
+        pad_idx     = Vocabulary.PAD_IDX,
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    print("Model loaded successfully — skipping training.")
+    return model, vocab
 
 # ---------------------------------------------------------------------------
 # Main
@@ -624,63 +662,46 @@ def main():
     print(f"\nTask   : {metadata['task_name']}")
     print(f"Classes: {metadata['label_map']}")
 
-    # ── Data ──────────────────────────────────────────────────────────────
-    print("\n── Data loading ─────────────────────────────────────────────")
-    train_loader, val_loader, vocab, class_weights = make_dataloaders( #test_loader as 3rd argument if we were using annotated test
-        data_dir   = args.data_dir,
-        batch_size = args.batch_size,
-        max_len    = args.max_len,
-    )
+    # ── Load or Train ──────────────────────────────────────────────────────
+    model, vocab = load_model(device, output_dir=args.output_dir)
 
-    # ── Model ─────────────────────────────────────────────────────────────
-    print("\n── Model ────────────────────────────────────────────────────")
-    model     = build_model(vocab, device, max_len=args.max_len)
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    if model is None:
+        print("\n── Data loading ─────────────────────────────────────────────")
+        train_loader, val_loader, vocab, class_weights = make_dataloaders(
+            data_dir   = args.data_dir,
+            batch_size = args.batch_size,
+            max_len    = args.max_len,
+        )
 
-    # ── Training ──────────────────────────────────────────────────────────
-    print("\n── Training ─────────────────────────────────────────────────")
-    history = train(
-        model, train_loader, val_loader,
-        criterion, optimizer, device,
-        epochs  = args.epochs,
-        patience= args.patience,
-    )
+        print("\n── Model ────────────────────────────────────────────────────")
+        model     = build_model(vocab, device, max_len=args.max_len)
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
 
-    # ── Evaluation ────────────────────────────────────────────────────────
-    print("\n── Evaluation ───────────────────────────────────────────────")
-    train_metrics = evaluate(model, train_loader, criterion, device)
-    val_metrics   = evaluate(model, val_loader,   criterion, device)
-   # test_metrics  = evaluate(model, test_loader,  criterion, device)
+        print("\n── Training ─────────────────────────────────────────────────")
+        history = train(
+            model, train_loader, val_loader,
+            criterion, optimizer, device,
+            epochs  = args.epochs,
+            patience= args.patience,
+        )
 
-    print(f"\n{'Split':<10} {'Loss':>8} {'Acc':>8} {'F1-macro':>10}")
-    print("-" * 40)
-    for split, m in [("Train", train_metrics), ("Val", val_metrics)]: #, ("Test", test_metrics)]:
-        print(f"{split:<10} {m['loss']:>8.4f} {m['accuracy']:>8.4f} {m['f1_macro']:>10.4f}")
+        print("\n── Evaluation ───────────────────────────────────────────────")
+        train_metrics = evaluate(model, train_loader, criterion, device)
+        val_metrics   = evaluate(model, val_loader,   criterion, device)
 
- #   print(f"\nPer-class F1 on test set:")
- #   for cls, key in zip(LABEL_NAMES, ["f1_E", "f1_I", "f1_A", "f1_O"]):
- #       print(f"  {cls:<10}: {test_metrics[key]:.4f}")
+        print(f"\n{'Split':<10} {'Loss':>8} {'Acc':>8} {'F1-macro':>10}")
+        print("-" * 40)
+        for split, m in [("Train", train_metrics), ("Val", val_metrics)]:
+            print(f"{split:<10} {m['loss']:>8.4f} {m['accuracy']:>8.4f} {m['f1_macro']:>10.4f}")
 
-    # Full classification report on test set
-    model.eval()
-    all_preds, all_targets = [], []
- #   with torch.no_grad():
- #       for input_ids, labels in test_loader:
- #           logits = model(input_ids.to(device))
- #           all_preds.extend(logits.argmax(1).cpu().numpy())
- #           all_targets.extend(labels.numpy())
- #   _save_classification_report(all_targets, all_preds, args.output_dir, "toxscan")
-
-    # ── Artifacts ─────────────────────────────────────────────────────────
-    all_metrics = {
-        "train": train_metrics,
-        "validation": val_metrics,
- #       "test": test_metrics,
-        "metadata": metadata,
-    }
-    save_artifacts(model, vocab, history, all_metrics,
-                   output_dir=args.output_dir, prefix="toxscan")
+        all_metrics = {
+            "train": train_metrics,
+            "validation": val_metrics,
+            "metadata": metadata,
+        }
+        save_artifacts(model, vocab, history, all_metrics,
+                       output_dir=args.output_dir, prefix="toxscan")
 
     # ── Quick inference demo ───────────────────────────────────────────────
     print("\n── Inference demo ───────────────────────────────────────────")
@@ -701,35 +722,34 @@ def main():
         print(f"{utt[:40]:<42} {label:>6}  {conf:>6.2%}")
 
     # ── Quality checks ────────────────────────────────────────────────────
-    print("\n" + "=" * 65)
-    print("QUALITY CHECKS")
-    print("=" * 65)
+    if 'history' in locals():
+        print("\n" + "=" * 65)
+        print("QUALITY CHECKS")
+        print("=" * 65)
 
-    checks = [
-        ("Val   accuracy  > 0.60", val_metrics["accuracy"]  > 0.60, val_metrics["accuracy"]),
-        ("Val   F1-macro  > 0.50", val_metrics["f1_macro"]  > 0.50, val_metrics["f1_macro"]),
- #       ("Test  accuracy  > 0.55", test_metrics["accuracy"] > 0.55, test_metrics["accuracy"]),
- #       ("Test  F1-macro  > 0.45", test_metrics["f1_macro"] > 0.45, test_metrics["f1_macro"]),
-        ("Train loss decreased",
-            history["train_loss"][-1] < history["train_loss"][0],
-            f"{history['train_loss'][0]:.4f} → {history['train_loss'][-1]:.4f}"),
-        ("No severe overfit (val_acc gap < 0.20)",
-            abs(train_metrics["accuracy"] - val_metrics["accuracy"]) < 0.20,
-            abs(train_metrics["accuracy"] - val_metrics["accuracy"])),
-    ]
+        checks = [
+            ("Val   accuracy  > 0.60", val_metrics["accuracy"]  > 0.60, val_metrics["accuracy"]),
+            ("Val   F1-macro  > 0.50", val_metrics["f1_macro"]  > 0.50, val_metrics["f1_macro"]),
+            ("Train loss decreased",
+                history["train_loss"][-1] < history["train_loss"][0],
+                f"{history['train_loss'][0]:.4f} → {history['train_loss'][-1]:.4f}"),
+            ("No severe overfit (val_acc gap < 0.20)",
+                abs(train_metrics["accuracy"] - val_metrics["accuracy"]) < 0.20,
+                abs(train_metrics["accuracy"] - val_metrics["accuracy"])),
+        ]
 
-    all_passed = True
-    for desc, passed, value in checks:
-        sym = "!OOO!" if passed else "!XXX!"
-        print(f"  {sym} {desc}: {value}")
-        all_passed = all_passed and passed
+        all_passed = True
+        for desc, passed, value in checks:
+            sym = "!OOO!" if passed else "!XXX!"
+            print(f"  {sym} {desc}: {value}")
+            all_passed = all_passed and passed
 
-    print("\n" + "=" * 65)
-    if all_passed:
-        print("PASS — all quality checks passed!")
-    else:
-        print("FAIL — one or more quality checks failed.")
-    print("=" * 65)
+        print("\n" + "=" * 65)
+        if all_passed:
+            print("PASS — all quality checks passed!")
+        else:
+            print("FAIL — one or more quality checks failed.")
+        print("=" * 65)
 
 
     while True:
@@ -750,7 +770,7 @@ def main():
         print(f"{user_input[:40]:<42} {label:>6}  {conf:>6.2%}")
         
 
-    return 0 if all_passed else 1
+    return 0 
 
 
 if __name__ == "__main__":
