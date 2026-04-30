@@ -1,21 +1,21 @@
 {
   "train": {
-    "loss": 0.3470411600584868,
-    "accuracy": 0.9295905476703574,
-    "f1_macro": 0.8658151280392159,
-    "f1_E": 0.8830199115044248,
-    "f1_I": 0.7860520094562647,
-    "f1_A": 0.8352810239287701,
-    "f1_O": 0.9589075672674037
+    "loss": 0.26581302058640777,
+    "accuracy": 0.9510292041316787,
+    "f1_macro": 0.9035722503750159,
+    "f1_E": 0.9231200897867564,
+    "f1_I": 0.8468354430379746,
+    "f1_A": 0.8725542041248017,
+    "f1_O": 0.9717792645505308
   },
   "validation": {
-    "loss": 0.6131650286318993,
-    "accuracy": 0.8913406887328653,
-    "f1_macro": 0.8007579192763956,
-    "f1_E": 0.8022782750203418,
-    "f1_I": 0.706199460916442,
-    "f1_A": 0.7590260285474392,
-    "f1_O": 0.9355279126213593
+    "loss": 0.8637387333338371,
+    "accuracy": 0.9059400423492701,
+    "f1_macro": 0.8143182310085125,
+    "f1_E": 0.8507588532883642,
+    "f1_I": 0.7129909365558912,
+    "f1_A": 0.7482352941176471,
+    "f1_O": 0.945287840072148
   },
   "metadata": {
     "task_name": "toxscan_intent_classification",
@@ -29,6 +29,6 @@
       "O": 3
     },
     "model": "TransformerEncoderClassifier",
-    "description": "4-class utterance-level intent classification on in-game chat. Transformer encoder over a learned vocabulary with [CLS] pooling."
+    "description": "4-class utterance-level intent classification on in-game chat. BPE subword tokens + char n-gram embeddings + TF-IDF bias."
   }
 }
