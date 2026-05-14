@@ -1,5 +1,5 @@
 """
-ToxScan AI — Transformer Encoder Classifier for In-Game Toxicity Detection
+ToxScan AI — Sentence Transformer Classifier for In-Game Toxicity Detection
 ============================================================================
 Joint intent classification on the CONDA dataset (CONtextual Dual-Annotated).
 
@@ -9,14 +9,30 @@ Intent classes (utterance-level):
     A = Action-based
     O = Other (non-toxic)
 
-Architecture: Transformer encoder (tfm_lvl2 scaffold) with a 4-way softmax
-classification head over the [CLS] token representation.
+Architecture: Pretrained Sentence Transformer encoder (frozen) with a
+2-layer MLP classification head over the pooled sentence embedding.
+
+Why Sentence Transformer over custom BPE encoder:
+  - Pretrained on hundreds of millions of sentence pairs; understands
+    word order, negation, and context out of the box.
+  - "I am happy, not sad" and "I am sad, not happy" get different embeddings.
+  - Handles short/slang utterances (GG, tr4sh, FUK) without needing
+    those exact strings in a training vocab.
+  - Frozen encoder + small head = far fewer trainable parameters,
+    which directly reduces overfitting on a small dataset like CONDA.
+
+Class imbalance strategy:
+  - WeightedRandomSampler: oversamples minority classes (I, A) each epoch.
+  - Weighted CrossEntropyLoss: penalizes minority-class errors more.
+  - Both together are stronger than either alone.
 
 Math:
-    Attention:      Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) * V
-    Cross-entropy:  L = -sum_c [ y_c * log(softmax(z)_c) ]
+    Embedding:     e = SentenceTransformer(utterance)  ∈ R^d  (frozen)
+    Head:          z = W2 · ReLU(W1 · e + b1) + b2
+    Cross-entropy: L = -sum_c [ y_c · log(softmax(z)_c) ]
 
 Usage:
+    pip install sentence-transformers
     python src/CONDA.py                       # expects data/ in project root
     python src/CONDA.py --data_dir path/to/data
 """
@@ -29,16 +45,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sentence_transformers import SentenceTransformer
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any
+
 
 # ---------------------------------------------------------------------------
 # Seeds & device
 # ---------------------------------------------------------------------------
 
-def set_seed(seed: int = 42): #42 is the answer to life, the universe, and everything
+def set_seed(seed: int = 42):
     """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -46,7 +64,7 @@ def set_seed(seed: int = 42): #42 is the answer to life, the universe, and every
         torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:   # try to retrieve a GPU if available, else fall back to CPU
+def get_device() -> torch.device:
     """Return CUDA if available, else CPU."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -57,92 +75,62 @@ def get_device() -> torch.device:   # try to retrieve a GPU if available, else f
 # Metadata
 # ---------------------------------------------------------------------------
 
-def get_task_metadata() -> Dict[str, Any]: #if we are using a json file to store metadata
-    """Return task metadata."""
+def get_task_metadata() -> Dict[str, Any]:
     return {
         "task_name": "toxscan_intent_classification",
         "task_type": "text_classification",
         "dataset": "CONDA (CONtextual Dual-Annotated)",
         "num_classes": 4,
         "label_map": {"E": 0, "I": 1, "A": 2, "O": 3},
-        "model": "TransformerEncoderClassifier",
+        "model": "SentenceTransformerClassifier",
         "description": (
             "4-class utterance-level intent classification on in-game chat. "
-            "Transformer encoder over a learned vocabulary with [CLS] pooling."
+            "Frozen pretrained Sentence Transformer + MLP head."
         ),
     }
 
 
 # ---------------------------------------------------------------------------
-# Vocabulary
+# Labels
 # ---------------------------------------------------------------------------
 
-class Vocabulary:
-    """Simple word-level vocabulary with <PAD> and <UNK> tokens."""
-
-    PAD_IDX = 0  # Padding token for sequence batching (fixed index for embedding layer)
-    UNK_IDX = 1  # Unkown token for out-of-vocab words
-
-    def __init__(self, max_size: int = 15000):
-        self.word2idx: Dict[str, int] = {"<PAD>": 0, "<UNK>": 1} # word to index mapping, starting with special tokens
-        self.idx2word: Dict[int, str] = {0: "<PAD>", 1: "<UNK>"} # index to word mapping, starting with special tokens
-        self.max_size = max_size # maximum vocabulary size (including special tokens)
-
-    # this creates a vocabulary from a list of raw text strings, counting word frequencies and keeping the most common ones up to max_size (accounting for special tokens)
-    def build(self, texts: List[str], min_freq: int = 1):
-        from collections import Counter
-        counts = Counter(w for text in texts for w in text.lower().split()) # count word frequencies across all texts (lowercased, split on whitespace)
-        for word, freq in counts.most_common(self.max_size - 2): # iterate over most common words up to max_size (accounting for 2 special tokens)
-            if freq >= min_freq: 
-                idx = len(self.word2idx)    # assign next available index
-                self.word2idx[word] = idx   # add word to word2idx mapping
-                self.idx2word[idx] = word   # add index to idx2word mapping
-
-    # this converts a raw text string into a list of token ids, using the vocabulary mapping and padding to max_len
-    def encode(self, text: str, max_len: int) -> List[int]:
-        tokens = text.lower().split()[:max_len]
-        ids = [self.word2idx.get(t, self.UNK_IDX) for t in tokens]
-        ids += [self.PAD_IDX] * (max_len - len(ids))   # pad to max_len
-        return ids
-
-    # this returns the size of the vocabulary (number of unique tokens including special tokens)
-    def __len__(self) -> int:
-        return len(self.word2idx) 
+LABEL_MAP   = {"E": 0, "I": 1, "A": 2, "O": 3}
+LABEL_NAMES = ["Explicit", "Implicit", "Action", "Other"]
 
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
-LABEL_MAP = {"E": 0, "I": 1, "A": 2, "O": 3}    # From intent class labels to integer indices for model training and evaluation
-LABEL_NAMES = ["Explicit", "Implicit", "Action", "Other"]
-
-
 class CONDADataset(Dataset):
     """
     PyTorch Dataset wrapping a CONDA CSV split.
 
-    Expected columns: 'utterance', 'intentClass' Id,matchId,conversationId,utterance,chatTime,playerSlot,playerId
+    Stores raw utterance strings and integer labels.
+    No pre-encoding — the Sentence Transformer handles tokenization
+    internally during the forward pass, so we just store text as-is.
 
+    Expected columns: 'utterance', 'intentClass'
     """
 
-    def __init__(self, texts: List[str], labels: List[int],
-                 vocab: Vocabulary, max_len: int):
-        self.texts = texts
+    def __init__(self, texts: List[str], labels: List[int]):
+        self.texts  = texts
         self.labels = labels
-        self.vocab = vocab
-        self.max_len = max_len
 
     def __len__(self) -> int:
-        return len(self.texts)
+        return len(self.labels)
 
-    # this retrieves the token ids and label for a single data point at index idx, encoding the text using the vocabulary and returning tensors for model input
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        ids = self.vocab.encode(self.texts[idx], self.max_len)
-        return (
-            torch.tensor(ids, dtype=torch.long),
-            torch.tensor(self.labels[idx], dtype=torch.long),
-        )
+    def __getitem__(self, idx: int) -> Tuple[str, int]:
+        return self.texts[idx], self.labels[idx]
+
+
+def collate_fn(batch):
+    """
+    Custom collate: keeps texts as a plain list of strings (not a tensor)
+    so the Sentence Transformer can receive them directly.
+    """
+    texts, labels = zip(*batch)
+    return list(texts), torch.tensor(labels, dtype=torch.long)
 
 
 # ---------------------------------------------------------------------------
@@ -159,182 +147,160 @@ def _load_split(path: str) -> Tuple[List[str], List[int]]:
     df = pd.read_csv(path)
 
     required = {"utterance", "intentClass"}
-    missing = required - set(df.columns)
+    missing  = required - set(df.columns)
     if missing:
         raise ValueError(f"{path} is missing columns: {missing}")
 
-    df = df.dropna(subset=["utterance", "intentClass"])
-    df = df[df["intentClass"].isin(LABEL_MAP)]          # drop any unlabelled rows
-
+    df     = df.dropna(subset=["utterance", "intentClass"])
+    df     = df[df["intentClass"].isin(LABEL_MAP)]
     texts  = df["utterance"].astype(str).tolist()
     labels = df["intentClass"].map(LABEL_MAP).tolist()
     return texts, labels
 
 
 def make_dataloaders(
-    data_dir: str = "data",
+    data_dir:   str = "data",
     batch_size: int = 32,
-    max_len: int = 64,
-    min_vocab_freq: int = 1,
-) -> Tuple[DataLoader, DataLoader, DataLoader, Vocabulary]:
+) -> Tuple[DataLoader, DataLoader, torch.Tensor]:
     """
-    Load CONDA train/valid/test CSVs and return DataLoaders + Vocabulary.
+    Load CONDA train/valid CSVs and return DataLoaders + class weights.
 
-    Expects:
-        <data_dir>/train.csv
-        <data_dir>/valid.csv
-        <data_dir>/test.csv
+    Imbalance is handled two ways:
+      1. WeightedRandomSampler  — each epoch sees a balanced class distribution.
+      2. class_weights tensor   — passed to CrossEntropyLoss in main().
+
+    Note: max_len and vocab are no longer needed; the Sentence Transformer
+    handles its own tokenization and truncation internally.
     """
     train_path = os.path.join(data_dir, "CONDA_train.csv")
     valid_path = os.path.join(data_dir, "CONDA_valid.csv")
-    test_path  = os.path.join(data_dir, "CONDA_test.csv")
 
-    for p in [train_path, valid_path, test_path]:
+    for p in [train_path, valid_path]:
         if not os.path.exists(p):
             raise FileNotFoundError(f"Expected data file not found: {p}")
 
     print("Loading CONDA splits...")
     train_texts, train_labels = _load_split(train_path)
     val_texts,   val_labels   = _load_split(valid_path)
-   # test_texts,  test_labels  = _load_split(test_path) #ommitted because test is unnanotated 
 
     print(f"  Train : {len(train_texts):,} samples")
     print(f"  Valid : {len(val_texts):,} samples")
-   # print(f"  Test  : {len(test_texts):,} samples")
 
-    # Build vocabulary on training data only (no leakage)
-    vocab = Vocabulary(max_size=15000)
-    vocab.build(train_texts, min_freq=min_vocab_freq)
-    print(f"  Vocabulary size: {len(vocab):,} tokens")
-
-    # Print class distribution
+    # Class distribution + weights
     from collections import Counter
-    dist = Counter(train_labels)
-    inv = {v: k for k, v in LABEL_MAP.items()}
+    dist  = Counter(train_labels)
+    inv   = {v: k for k, v in LABEL_MAP.items()}
+    total = len(train_labels)
     print("  Train class distribution:")
     for idx in sorted(dist):
         print(f"    {inv[idx]} ({LABEL_NAMES[idx]}): {dist[idx]:,}")
 
-    # Compute class weights for imbalanced loss
-    total = len(train_labels)
-    weights = torch.FloatTensor([
+    class_weights = torch.FloatTensor([
         total / (4 * dist.get(i, 1)) for i in range(4)
     ])
 
-    def make_loader(texts, labels, shuffle):
-        ds = CONDADataset(texts, labels, vocab, max_len)
-        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                          num_workers=0, pin_memory=False)
+    # WeightedRandomSampler: each sample's weight = 1 / its class frequency.
+    # This means minority classes (I, A) are sampled more often each epoch.
+    sample_weights = [1.0 / dist[label] for label in train_labels]
+    sampler = WeightedRandomSampler(
+        weights     = sample_weights,
+        num_samples = len(sample_weights),
+        replacement = True,
+    )
 
-    train_loader = make_loader(train_texts, train_labels, shuffle=True)
-    val_loader   = make_loader(val_texts,   val_labels,   shuffle=False)
-   # test_loader  = make_loader(test_texts,  test_labels,  shuffle=False)
+    train_ds = CONDADataset(train_texts, train_labels)
+    val_ds   = CONDADataset(val_texts,   val_labels)
 
-    return train_loader, val_loader, vocab, weights #normallly, include test_loader as 3rd arg
+    # sampler is mutually exclusive with shuffle=True
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
+                              sampler=sampler, collate_fn=collate_fn,
+                              num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+                              shuffle=False, collate_fn=collate_fn,
+                              num_workers=0, pin_memory=False)
+
+    return train_loader, val_loader, class_weights
 
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
-class _EncoderLayer(nn.Module):
-    """Single pre-norm transformer encoder layer."""
-
-    def __init__(self, d_model: int, num_heads: int,
-                 dim_ff: int, dropout: float):
-        super().__init__()
-        self.attn  = nn.MultiheadAttention(d_model, num_heads,
-                                           dropout=dropout, batch_first=False)
-        self.ff1   = nn.Linear(d_model, dim_ff)
-        self.ff2   = nn.Linear(dim_ff, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.drop  = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor,
-                key_padding_mask: torch.Tensor = None) -> torch.Tensor:
-        # Pre-norm self-attention
-        x2 = self.norm1(x)
-        x2, _ = self.attn(x2, x2, x2, key_padding_mask=key_padding_mask)
-        x = x + self.drop(x2)
-        # Pre-norm feed-forward
-        x2 = self.norm2(x)
-        x2 = self.ff2(self.drop(torch.relu(self.ff1(x2))))
-        x = x + self.drop(x2)
-        return x
-
-
-class TransformerEncoderClassifier(nn.Module):
+class SentenceTransformerClassifier(nn.Module):
     """
-    Encoder-only transformer for 4-class intent classification.
+    Frozen pretrained Sentence Transformer + trainable MLP classification head.
 
-    Input  : (batch, seq_len)  — token ids
-    Output : (batch, 4)        — raw logits (pass through CrossEntropyLoss)
+    The encoder is frozen: its weights never change during training.
+    Only the two-layer MLP head is trained, which means:
+      - Far fewer parameters to overfit (256*emb_dim + 256*4 vs full encoder).
+      - Training is fast — embeddings can be computed without autograd.
+      - Still benefits from rich pretrained representations.
+
+    To fine-tune the full encoder instead, pass freeze_encoder=False.
+    This requires more VRAM and a lower learning rate (~1e-5).
+
+    Input  : list of raw utterance strings (batch)
+    Output : (batch, 4) raw logits
     """
 
-    def __init__(self, vocab_size: int, d_model: int = 128,
-                 num_heads: int = 4, num_layers: int = 2,
-                 dim_ff: int = 256, num_classes: int = 4,
-                 max_len: int = 64, dropout: float = 0.1,
-                 pad_idx: int = 0):
+    # paraphrase-multilingual handles non-English player IDs and utterances
+    # in the CONDA dataset (Vietnamese names, mixed-language chat, etc.)
+    DEFAULT_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+
+    def __init__(
+        self,
+        model_name:     str   = DEFAULT_MODEL,
+        num_classes:    int   = 4,
+        freeze_encoder: bool  = True,
+    ):
         super().__init__()
-        self.pad_idx   = pad_idx
-        self.d_model   = d_model
-        self.max_len   = max_len
-        self.vocab_size = vocab_size
+        print(f"  Loading pretrained encoder: {model_name}")
+        self.encoder        = SentenceTransformer(model_name)
+        self.freeze_encoder = freeze_encoder
 
-        self.embedding   = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
-        self.pos_enc     = nn.Parameter(torch.randn(1, max_len, d_model) * 0.01)
-        self.drop        = nn.Dropout(dropout)
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            print("  Encoder frozen — training MLP head only.")
 
-        self.layers = nn.ModuleList([
-            _EncoderLayer(d_model, num_heads, dim_ff, dropout)
-            for _ in range(num_layers)
-        ])
-        self.norm       = nn.LayerNorm(d_model)
-        self.classifier = nn.Linear(d_model, num_classes)
-        self._init_weights()
+        # Infer embedding dimension from a single dummy forward pass
+        with torch.no_grad():
+            dummy = self.encoder.encode(["test"], convert_to_tensor=True)
+        emb_dim = dummy.shape[-1]
+        print(f"  Embedding dim: {emb_dim}")
 
-    def _init_weights(self):
-        nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
-        nn.init.uniform_(self.classifier.weight, -0.1, 0.1)
-        nn.init.zeros_(self.classifier.bias)
+        # Two-layer MLP head
+        self.head = nn.Sequential(
+            nn.Linear(emb_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+        )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # input_ids: (batch, seq_len)
-        key_padding_mask = (input_ids == self.pad_idx)       # (batch, seq_len)
-
-        x = self.embedding(input_ids)                        # (batch, seq_len, d_model)
-        x = x + self.pos_enc[:, :x.size(1), :]
-        x = self.drop(x)
-
-        x = x.transpose(0, 1)                               # (seq_len, batch, d_model)
-        for layer in self.layers:
-            x = layer(x, key_padding_mask=key_padding_mask)
-        x = self.norm(x)
-
-        cls = x[0]                                           # [CLS] = first token position
-        return self.classifier(self.drop(cls))               # (batch, num_classes)
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        """
+        texts   : list of raw utterance strings (one per sample in batch)
+        returns : (batch, num_classes) logits
+        """
+        embeddings = self.encoder.encode(
+            texts,
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return self.head(embeddings)
 
 
-def build_model(vocab: Vocabulary, device: torch.device,
-                max_len: int = 64) -> TransformerEncoderClassifier:
+def build_model(device: torch.device) -> SentenceTransformerClassifier:
     """Instantiate and return the model on the correct device."""
-    model = TransformerEncoderClassifier(
-        vocab_size  = len(vocab),
-        d_model     = 128,
-        num_heads   = 4,
-        num_layers  = 2,
-        dim_ff      = 256,
-        num_classes = 4,
-        max_len     = max_len,
-        dropout     = 0.1,
-        pad_idx     = Vocabulary.PAD_IDX,
+    model = SentenceTransformerClassifier(
+        model_name     = SentenceTransformerClassifier.DEFAULT_MODEL,
+        num_classes    = 4,
+        freeze_encoder = True,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: {model.__class__.__name__} | "
-          f"Params: {n_params:,} | Vocab: {len(vocab):,}")
+    print(f"Model: {model.__class__.__name__} | Trainable params: {n_params:,}")
     return model
 
 
@@ -343,25 +309,22 @@ def build_model(vocab: Vocabulary, device: torch.device,
 # ---------------------------------------------------------------------------
 
 def train(
-    model: nn.Module,
+    model:        nn.Module,
     train_loader: DataLoader,
-    val_loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    epochs: int = 10,
-    patience: int = 3,
-    verbose: bool = True,
+    val_loader:   DataLoader,
+    criterion:    nn.Module,
+    optimizer:    optim.Optimizer,
+    device:       torch.device,
+    epochs:       int  = 10,
+    patience:     int  = 3,
+    verbose:      bool = True,
 ) -> Dict[str, List[float]]:
-    """
-    Train with early stopping on validation macro-F1.
-    Returns training history dict.
-    """
+    """Train with early stopping on validation macro-F1."""
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.5, patience=2
     )
 
-    history = {"train_loss": [], "val_loss": [], "val_f1": [], "val_acc": []}
+    history      = {"train_loss": [], "val_loss": [], "val_f1": [], "val_acc": []}
     best_f1      = 0.0
     best_state   = None
     patience_ctr = 0
@@ -370,12 +333,11 @@ def train(
         model.train()
         total_loss, correct, total = 0.0, 0, 0
 
-        for input_ids, labels in train_loader:
-            input_ids = input_ids.to(device)
-            labels    = labels.to(device)
+        for texts, labels in train_loader:          # texts is a list[str], not a tensor
+            labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(input_ids)
+            logits = model(texts)                   # model encodes internally
             loss   = criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -391,7 +353,7 @@ def train(
 
         val_metrics = evaluate(model, val_loader, criterion, device)
         scheduler.step(val_metrics["f1_macro"])
-        print(f"Current LR: {optimizer.param_groups[0]['lr']}")
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}")
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
@@ -405,10 +367,9 @@ def train(
                   f"val_acc={val_metrics['accuracy']:.4f}  "
                   f"val_f1={val_metrics['f1_macro']:.4f}")
 
-        # Early stopping
         if val_metrics["f1_macro"] > best_f1:
-            best_f1    = val_metrics["f1_macro"]
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_f1      = val_metrics["f1_macro"]
+            best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_ctr = 0
         else:
             patience_ctr += 1
@@ -416,7 +377,6 @@ def train(
                 print(f"Early stopping at epoch {epoch} (best val F1={best_f1:.4f})")
                 break
 
-    # Restore best weights
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
@@ -428,46 +388,40 @@ def train(
 # ---------------------------------------------------------------------------
 
 def evaluate(
-    model: nn.Module,
+    model:       nn.Module,
     data_loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
+    criterion:   nn.Module,
+    device:      torch.device,
 ) -> Dict[str, float]:
-    """
-    Evaluate model. Returns dict with loss, accuracy, f1_macro,
-    and per-class f1 scores.
-    """
+    """Evaluate model. Returns loss, accuracy, f1_macro, and per-class F1."""
     model.eval()
-    total_loss = 0.0
+    total_loss             = 0.0
     all_preds, all_targets = [], []
 
     with torch.no_grad():
-        for input_ids, labels in data_loader:
-            input_ids = input_ids.to(device)
-            labels    = labels.to(device)
-
-            logits = model(input_ids)
+        for texts, labels in data_loader:           # texts is list[str]
+            labels = labels.to(device)
+            logits = model(texts)
             loss   = criterion(logits, labels)
             total_loss += loss.item()
-
             preds = logits.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(labels.cpu().numpy())
 
-    avg_loss = total_loss / len(data_loader)
-    accuracy = accuracy_score(all_targets, all_preds)
-    f1_macro = f1_score(all_targets, all_preds, average="macro", zero_division=0)
+    avg_loss     = total_loss / len(data_loader)
+    accuracy     = accuracy_score(all_targets, all_preds)
+    f1_macro     = f1_score(all_targets, all_preds, average="macro",   zero_division=0)
     f1_per_class = f1_score(all_targets, all_preds, average=None,
                             labels=[0, 1, 2, 3], zero_division=0)
 
     return {
-        "loss":      avg_loss,
-        "accuracy":  accuracy,
-        "f1_macro":  f1_macro,
-        "f1_E":      float(f1_per_class[0]),
-        "f1_I":      float(f1_per_class[1]),
-        "f1_A":      float(f1_per_class[2]),
-        "f1_O":      float(f1_per_class[3]),
+        "loss":     avg_loss,
+        "accuracy": accuracy,
+        "f1_macro": f1_macro,
+        "f1_E":     float(f1_per_class[0]),
+        "f1_I":     float(f1_per_class[1]),
+        "f1_A":     float(f1_per_class[2]),
+        "f1_O":     float(f1_per_class[3]),
     }
 
 
@@ -476,15 +430,13 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 def predict(
-    model: nn.Module,
-    texts: List[str],
-    vocab: Vocabulary,
-    device: torch.device,
-    max_len: int = 64,
+    model:      nn.Module,
+    texts:      List[str],
+    device:     torch.device,
     batch_size: int = 64,
 ) -> np.ndarray:
     """
-    Run inference on a list of raw utterance strings.
+    Run inference on raw utterance strings.
     Returns integer class predictions (0=E, 1=I, 2=A, 3=O).
     """
     model.eval()
@@ -492,32 +444,25 @@ def predict(
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
-        ids   = [vocab.encode(t, max_len) for t in batch]
-        t     = torch.tensor(ids, dtype=torch.long).to(device)
         with torch.no_grad():
-            preds = model(t).argmax(dim=1)
+            preds = model(batch).argmax(dim=1)
         all_preds.extend(preds.cpu().numpy())
 
     return np.array(all_preds)
 
 
 def predict_proba(
-    model: nn.Module,
-    texts: List[str],
-    vocab: Vocabulary,
+    model:  nn.Module,
+    texts:  List[str],
     device: torch.device,
-    max_len: int = 64,
 ) -> np.ndarray:
     """
     Return softmax probability distributions over the 4 intent classes.
     Shape: (N, 4)
     """
     model.eval()
-    ids = [vocab.encode(t, max_len) for t in texts]
-    t   = torch.tensor(ids, dtype=torch.long).to(device)
     with torch.no_grad():
-        logits = model(t)
-        probs  = torch.softmax(logits, dim=1)
+        probs = torch.softmax(model(texts), dim=1)
     return probs.cpu().numpy()
 
 
@@ -526,45 +471,29 @@ def predict_proba(
 # ---------------------------------------------------------------------------
 
 def save_artifacts(
-    model: nn.Module,
-    vocab: Vocabulary,
-    history: Dict,
-    metrics: Dict,
+    model:      nn.Module,
+    history:    Dict,
+    metrics:    Dict,
     output_dir: str = "output",
-    prefix: str = "toxscan",
+    prefix:     str = "toxscan",
 ):
-    """Save model checkpoint, vocabulary, metrics JSON, and training curve."""
+    """Save model head checkpoint, metrics JSON, and training curve."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Model checkpoint
+    # Save the full model state (frozen encoder buffers + trained head weights)
     ckpt_path = os.path.join(output_dir, f"{prefix}_model.pt")
     torch.save({
         "model_state_dict": model.state_dict(),
-        "vocab_size":       model.vocab_size,
-        "d_model":          model.d_model,
-        "max_len":          model.max_len,
-        "num_classes":      4,
         "label_map":        LABEL_MAP,
     }, ckpt_path)
 
-    # Vocabulary
-    vocab_path = os.path.join(output_dir, f"{prefix}_vocab.json")
-    with open(vocab_path, "w") as f:
-        json.dump({"word2idx": vocab.word2idx}, f)
-
-    # Metrics
     metrics_path = os.path.join(output_dir, f"{prefix}_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Training curve
     _save_training_curve(history, output_dir, prefix)
 
     print(f"\nArtifacts saved to '{output_dir}/'")
-    print(f"  {os.path.basename(ckpt_path)}")
-    print(f"  {os.path.basename(vocab_path)}")
-    print(f"  {os.path.basename(metrics_path)}")
-    print(f"  {prefix}_training_curve.png")
 
 
 def _save_training_curve(history: Dict, output_dir: str, prefix: str):
@@ -598,44 +527,30 @@ def _save_classification_report(all_targets, all_preds, output_dir, prefix):
     print("\nClassification report:")
     print(report)
 
-# ---------------------------------------------------------------------------
-# Loading full model for inference or further training
-# ---------------------------------------------------------------------------
-def load_model(
-    device: torch.device,
-    output_dir: str = "output",
-    prefix: str = "toxscan",
-):
-    """Load saved model and vocab if they exist. Returns (model, vocab) or (None, None)."""
-    ckpt_path  = os.path.join(output_dir, f"{prefix}_model.pt")
-    vocab_path = os.path.join(output_dir, f"{prefix}_vocab.json")
 
-    if not os.path.exists(ckpt_path) or not os.path.exists(vocab_path):
-        return None, None
+# ---------------------------------------------------------------------------
+# Load saved model
+# ---------------------------------------------------------------------------
+
+def load_model(
+    device:     torch.device,
+    output_dir: str = "output",
+    prefix:     str = "toxscan",
+) -> nn.Module:
+    """Load saved head checkpoint if it exists. Returns model or None."""
+    ckpt_path = os.path.join(output_dir, f"{prefix}_model.pt")
+
+    if not os.path.exists(ckpt_path):
+        return None
 
     print(f"Found existing checkpoint — loading from '{output_dir}/'")
-
-    # Rebuild vocab from saved JSON
-    with open(vocab_path, "r") as f:
-        data = json.load(f)
-    vocab = Vocabulary()
-    vocab.word2idx = data["word2idx"]
-    vocab.idx2word = {v: k for k, v in vocab.word2idx.items()}
-
-    # Rebuild model and load weights
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model = TransformerEncoderClassifier(
-        vocab_size  = ckpt["vocab_size"],
-        d_model     = ckpt["d_model"],
-        num_classes = ckpt["num_classes"],
-        max_len     = ckpt["max_len"],
-        pad_idx     = Vocabulary.PAD_IDX,
-    ).to(device)
+    model = SentenceTransformerClassifier().to(device)
+    ckpt  = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-
     print("Model loaded successfully — skipping training.")
-    return model, vocab
+    return model
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -643,17 +558,16 @@ def load_model(
 
 def main():
     parser = argparse.ArgumentParser(description="ToxScan AI — CONDA intent classifier")
-    parser.add_argument("--data_dir",   default="data",   help="Path to folder with train/valid/test CSV")
+    parser.add_argument("--data_dir",   default="data",   help="Folder with train/valid CSV")
     parser.add_argument("--output_dir", default="output", help="Where to save artifacts")
-    parser.add_argument("--epochs",     type=int, default=15)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr",         type=float, default=5e-4)
-    parser.add_argument("--max_len",    type=int, default=64)
-    parser.add_argument("--patience",   type=int, default=4)
+    parser.add_argument("--epochs",     type=int,   default=15)
+    parser.add_argument("--batch_size", type=int,   default=32)
+    parser.add_argument("--lr",         type=float, default=1e-3)
+    parser.add_argument("--patience",   type=int,   default=4)
     args = parser.parse_args()
 
     print("=" * 65)
-    print("ToxScan AI — Transformer Encoder for In-Game Toxicity Detection")
+    print("ToxScan AI — Sentence Transformer for In-Game Toxicity Detection")
     print("=" * 65)
 
     set_seed(42)
@@ -663,18 +577,17 @@ def main():
     print(f"Classes: {metadata['label_map']}")
 
     # ── Load or Train ──────────────────────────────────────────────────────
-    model, vocab = load_model(device, output_dir=args.output_dir)
+    model = load_model(device, output_dir=args.output_dir)
 
     if model is None:
         print("\n── Data loading ─────────────────────────────────────────────")
-        train_loader, val_loader, vocab, class_weights = make_dataloaders(
+        train_loader, val_loader, class_weights = make_dataloaders(
             data_dir   = args.data_dir,
             batch_size = args.batch_size,
-            max_len    = args.max_len,
         )
 
         print("\n── Model ────────────────────────────────────────────────────")
-        model     = build_model(vocab, device, max_len=args.max_len)
+        model     = build_model(device)
         criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
 
@@ -694,13 +607,13 @@ def main():
         print("-" * 40)
         for split, m in [("Train", train_metrics), ("Val", val_metrics)]:
             print(f"{split:<10} {m['loss']:>8.4f} {m['accuracy']:>8.4f} {m['f1_macro']:>10.4f}")
+        print(f"\nPer-class F1 (val):")
+        for cls, key in zip(LABEL_NAMES, ["f1_E", "f1_I", "f1_A", "f1_O"]):
+            print(f"  {cls:<12}: {val_metrics[key]:.4f}")
 
-        all_metrics = {
-            "train": train_metrics,
-            "validation": val_metrics,
-            "metadata": metadata,
-        }
-        save_artifacts(model, vocab, history, all_metrics,
+        save_artifacts(model, history,
+                       {"train": train_metrics, "validation": val_metrics,
+                        "metadata": metadata},
                        output_dir=args.output_dir, prefix="toxscan")
 
     # ── Quick inference demo ───────────────────────────────────────────────
@@ -712,8 +625,8 @@ def main():
         "reported you for feeding",
         "push mid now",
     ]
-    preds = predict(model, sample_utterances, vocab, device, max_len=args.max_len)
-    probs = predict_proba(model, sample_utterances, vocab, device, max_len=args.max_len)
+    preds = predict(model, sample_utterances, device)
+    probs = predict_proba(model, sample_utterances, device)
     print(f"\n{'Utterance':<42} {'Pred':>6}  {'Conf':>6}")
     print("-" * 58)
     for utt, pred, prob in zip(sample_utterances, preds, probs):
@@ -721,56 +634,46 @@ def main():
         conf  = prob[int(pred)]
         print(f"{utt[:40]:<42} {label:>6}  {conf:>6.2%}")
 
-    # ── Quality checks ────────────────────────────────────────────────────
-    if 'history' in locals():
+    # ── Quality checks ─────────────────────────────────────────────────────
+    if "history" in locals():
         print("\n" + "=" * 65)
         print("QUALITY CHECKS")
         print("=" * 65)
-
         checks = [
             ("Val   accuracy  > 0.60", val_metrics["accuracy"]  > 0.60, val_metrics["accuracy"]),
             ("Val   F1-macro  > 0.50", val_metrics["f1_macro"]  > 0.50, val_metrics["f1_macro"]),
             ("Train loss decreased",
-                history["train_loss"][-1] < history["train_loss"][0],
-                f"{history['train_loss'][0]:.4f} → {history['train_loss'][-1]:.4f}"),
+             history["train_loss"][-1] < history["train_loss"][0],
+             f"{history['train_loss'][0]:.4f} → {history['train_loss'][-1]:.4f}"),
             ("No severe overfit (val_acc gap < 0.20)",
-                abs(train_metrics["accuracy"] - val_metrics["accuracy"]) < 0.20,
-                abs(train_metrics["accuracy"] - val_metrics["accuracy"])),
+             abs(train_metrics["accuracy"] - val_metrics["accuracy"]) < 0.20,
+             abs(train_metrics["accuracy"] - val_metrics["accuracy"])),
         ]
-
         all_passed = True
         for desc, passed, value in checks:
             sym = "!OOO!" if passed else "!XXX!"
             print(f"  {sym} {desc}: {value}")
             all_passed = all_passed and passed
-
         print("\n" + "=" * 65)
-        if all_passed:
-            print("PASS — all quality checks passed!")
-        else:
-            print("FAIL — one or more quality checks failed.")
+        print("PASS" if all_passed else "FAIL — one or more quality checks failed.")
         print("=" * 65)
 
-
+    # ── Interactive loop ───────────────────────────────────────────────────
     while True:
         print()
         user_input = input("Enter a string to evaluate or q to quit: ")
         if user_input.lower() == "q":
             break
 
-        sample = [user_input] # needed to make a list of batch size = 1 for predict, predict_proba
-        predictions = predict(model, sample, vocab, device, max_len=args.max_len)
-        probabilities = predict_proba(model, sample, vocab, device, max_len=args.max_len)
-        prediction = predictions[0]
-        probability = probabilities[0]
+        preds_i = predict(model, [user_input], device)
+        probs_i = predict_proba(model, [user_input], device)
+        label   = inv_label[int(preds_i[0])]
+        conf    = probs_i[0][int(preds_i[0])]
         print(f"\n{'Utterance':<42} {'Pred':>6}  {'Conf':>6}")
         print("-" * 58)
-        label = inv_label[int(prediction)]
-        conf = probability[int(prediction)]
         print(f"{user_input[:40]:<42} {label:>6}  {conf:>6.2%}")
-        
 
-    return 0 
+    return 0
 
 
 if __name__ == "__main__":
