@@ -273,7 +273,7 @@ class SentenceTransformerClassifier(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(emb_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(256, num_classes),
         )
 
@@ -288,7 +288,7 @@ class SentenceTransformerClassifier(nn.Module):
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        return self.head(embeddings)
+        return self.head(embeddings.clone())
 
 
 def build_model(device: torch.device) -> SentenceTransformerClassifier:
