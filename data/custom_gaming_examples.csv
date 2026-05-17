@@ -1,0 +1,41 @@
+utterance,intentClass
+"you're actually so trash",E
+"uninstall the game",E
+"bot player",E
+"you're completely useless",E
+"dogwater teammate",E
+"you sold the whole match",E
+"worst player i've ever seen",E
+"stop feeding idiot",E
+"learn how to aim",E
+"absolute clown player",E
+"nice aim bro",I
+"great job missing every shot",I
+"wow amazing teamwork there",I
+"totally useful teammate",I
+"you're carrying us backwards",I
+"nice throw",I
+"good one genius",I
+"love having teammates like you",I
+"that was definitely intentional",I
+"you're helping the enemy team more",I
+"report this guy",A
+"mute this teammate",A
+"kick him from the party",A
+"ban this thrower",A
+"please report jungle",A
+"everyone mute this guy",A
+"send the replay to mods",A
+"admin should remove him",A
+"block this player",A
+"queue dodge this toxic guy",A
+"rotate to B site",O
+"save your ultimate",O
+"group up after respawn",O
+"good try team",O
+"we can still win this",O
+"watch flank",O
+"i need healing",O
+"push together next round",O
+"nice clutch",O
+"let's defend objective",O

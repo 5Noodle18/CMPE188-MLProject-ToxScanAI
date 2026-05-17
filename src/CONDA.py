@@ -185,8 +185,19 @@ def _load_split(path: str) -> Tuple[List[str], List[int]]:
         import pandas as pd
     except ImportError:
         raise ImportError("pandas is required: pip install pandas")
+    
+    print(f"Reading: {path}", flush=True)
+    df = pd.read_csv(path, engine="python")
+    print(f"Loaded: {path} with shape {df.shape}", flush=True)
 
     df = pd.read_csv(path)
+
+    # Add custom gaming examples ONLY to training split
+    if "train" in path.lower():
+        custom_df = pd.read_csv("data/custom_gaming_examples.csv")
+        df = pd.concat([df, custom_df], ignore_index=True)
+
+        print(f"Added {len(custom_df)} custom gaming examples")
 
     required = {"utterance", "intentClass"}
     missing  = required - set(df.columns)
