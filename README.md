@@ -2,7 +2,7 @@
 ToxScan AI accurately sorts through data gaming chats and identify whether there is any abusive language in the texts. A user can input text as a query and the model will evaluate its toxicity score based on context and wording. It looks through given datasets and picks out which ones have higher toxicity scores, and which texts likely do not have any animosity. Ideas for project extentions include: self-collected datasets from various games, real-time moderation/censoring, an additional explanation of why the AI thinks the sample is toxic, and tailoring it for one game specifically. 
 
 ### Current Implementation Progress: 
-We are setting up the framework for the model and starting on the basic code. 
+We have a model currently made, but due to the small dataset it is not too good yet. Front end has been implemented using streamlit. To run our program, download everything from requirements.txt in a virtual environment, try "python src\CONDA.py", then after the training, try "streamlit run app.py". 
 
 ## Planned Model/System Approach:
 The model is trained using labeled datasets. 
