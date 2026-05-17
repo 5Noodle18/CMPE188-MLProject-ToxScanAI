@@ -190,8 +190,6 @@ def _load_split(path: str) -> Tuple[List[str], List[int]]:
     df = pd.read_csv(path, engine="python")
     print(f"Loaded: {path} with shape {df.shape}", flush=True)
 
-    df = pd.read_csv(path)
-
     # Add custom gaming examples ONLY to training split
     if "train" in path.lower():
         custom_df = pd.read_csv("data/custom_gaming_examples.csv")
