@@ -55,14 +55,16 @@ from typing import Dict, List, Tuple, Any
 EXPLANATION_RULES = {
     "Explicit": [
         "idiot", "trash", "stupid", "loser", "moron",
-        "kill yourself", "dumb"
+        "kill yourself", "dumb", "kys", "dumbass", "bitch",
+        "fuck", "motherfucker"
     ],
     "Implicit": [
         "nice job", "sure buddy", "wow amazing",
-        "good one"
+        "good one", "haha"
     ],
     "Action": [
-        "reported", "muted", "kick", "ban"
+        "reported", "report", "muted", "mute", "kick", "kicked",
+        "ban", "banned", "boot", "booted"
     ]
 }
 
@@ -125,7 +127,7 @@ def explain_prediction(text, label):
         reasons.append("References moderation or player actions")
 
     if not reasons:
-        reasons.append("Detected contextual toxicity patterns")
+        reasons.append("Unable to detect contextual toxicity patterns")
 
     return reasons
 
@@ -325,6 +327,7 @@ class SentenceTransformerClassifier(nn.Module):
         embeddings = self.encoder.encode(
             texts,
             convert_to_tensor=True,
+            device=str(next(self.head.parameters()).device),
             normalize_embeddings=True,
             show_progress_bar=False,
         )
