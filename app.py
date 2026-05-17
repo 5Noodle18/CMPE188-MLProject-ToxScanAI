@@ -19,12 +19,14 @@ def explain_prediction(text, label):
         if keyword in text_lower:
             reasons.append(f'Contains phrase: "{keyword}"')
 
+    
     if label == "Explicit":
         reasons.append("Direct hostile language detected")
     elif label == "Implicit":
         reasons.append("Possible sarcasm or passive-aggressive tone")
     elif label == "Action":
         reasons.append("References moderation or player actions")
+        
     else:
         reasons.append("No strong toxic language detected")
 
@@ -56,6 +58,9 @@ if st.button("Analyze"):
         pred_idx = int(probs.argmax())
         pred_label = LABEL_NAMES[pred_idx]
         confidence = probs[pred_idx]
+
+        if confidence < 0.60:
+            pred_label = "Uncertain"
 
         st.subheader("Result")
         st.metric("Prediction", pred_label)
