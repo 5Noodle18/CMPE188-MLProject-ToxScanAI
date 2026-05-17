@@ -1,21 +1,21 @@
 {
   "train": {
-    "loss": 0.34780023654927267,
-    "accuracy": 0.9291818384483912,
-    "f1_macro": 0.8648840501524269,
-    "f1_E": 0.8829979181124219,
-    "f1_I": 0.7861783815711755,
-    "f1_A": 0.831672203765227,
-    "f1_O": 0.9586876971608833
+    "loss": 0.1312912378566353,
+    "accuracy": 0.8573233261499591,
+    "f1_macro": 0.8441778720584692,
+    "f1_E": 0.8975475257582354,
+    "f1_I": 0.9038500575140402,
+    "f1_A": 0.8979510111459654,
+    "f1_O": 0.677362893815636
   },
   "validation": {
-    "loss": 0.6103842859670149,
-    "accuracy": 0.890114788810877,
-    "f1_macro": 0.8002726429595115,
-    "f1_E": 0.7980613893376414,
-    "f1_I": 0.7076923076923077,
-    "f1_A": 0.7608695652173914,
-    "f1_O": 0.9344673095907055
+    "loss": 0.7520759364464105,
+    "accuracy": 0.6020283071436532,
+    "f1_macro": 0.538730904620394,
+    "f1_E": 0.6330845771144279,
+    "f1_I": 0.42618510158013545,
+    "f1_A": 0.4211822660098522,
+    "f1_O": 0.6744716737771604
   },
   "metadata": {
     "task_name": "toxscan_intent_classification",
@@ -28,7 +28,7 @@
       "A": 2,
       "O": 3
     },
-    "model": "TransformerEncoderClassifier",
-    "description": "4-class utterance-level intent classification on in-game chat. Transformer encoder over a learned vocabulary with [CLS] pooling."
+    "model": "SentenceTransformerClassifier",
+    "description": "4-class utterance-level intent classification on in-game chat. Frozen pretrained Sentence Transformer + MLP head."
   }
 }

@@ -52,6 +52,21 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Any
 
 
+EXPLANATION_RULES = {
+    "Explicit": [
+        "idiot", "trash", "stupid", "loser", "moron",
+        "kill yourself", "dumb"
+    ],
+    "Implicit": [
+        "nice job", "sure buddy", "wow amazing",
+        "good one"
+    ],
+    "Action": [
+        "reported", "muted", "kick", "ban"
+    ]
+}
+
+
 # ---------------------------------------------------------------------------
 # Seeds & device
 # ---------------------------------------------------------------------------
@@ -88,6 +103,31 @@ def get_task_metadata() -> Dict[str, Any]:
             "Frozen pretrained Sentence Transformer + MLP head."
         ),
     }
+
+
+# Explanations 
+def explain_prediction(text, label):
+    text_lower = text.lower()
+
+    reasons = []
+
+    for keyword in EXPLANATION_RULES.get(label, []):
+        if keyword in text_lower:
+            reasons.append(f'Contains phrase: "{keyword}"')
+
+    if label == "Explicit":
+        reasons.append("Direct hostile language detected")
+
+    elif label == "Implicit":
+        reasons.append("Possible sarcasm or passive-aggressive tone")
+
+    elif label == "Action":
+        reasons.append("References moderation or player actions")
+
+    if not reasons:
+        reasons.append("Detected contextual toxicity patterns")
+
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -480,11 +520,11 @@ def save_artifacts(
     """Save model head checkpoint, metrics JSON, and training curve."""
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save the full model state (frozen encoder buffers + trained head weights)
+    # Save ONLY the trained classifier head
     ckpt_path = os.path.join(output_dir, f"{prefix}_model.pt")
     torch.save({
-        "model_state_dict": model.state_dict(),
-        "label_map":        LABEL_MAP,
+        "head_state_dict": model.head.state_dict(),
+        "label_map": LABEL_MAP,
     }, ckpt_path)
 
     metrics_path = os.path.join(output_dir, f"{prefix}_metrics.json")
@@ -545,8 +585,8 @@ def load_model(
 
     print(f"Found existing checkpoint — loading from '{output_dir}/'")
     model = SentenceTransformerClassifier().to(device)
-    ckpt  = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.head.load_state_dict(ckpt["head_state_dict"])
     model.eval()
     print("Model loaded successfully — skipping training.")
     return model
